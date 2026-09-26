@@ -33,6 +33,14 @@ YAML 场景，服务按**会话令牌**隔离每个调用方的当前状态，�
 结果与 `first_difference`，任一侧单步失败只记录该侧、不影响另一侧。整个过程
 **不写 sessions/events、不持久化随机计数**，可反复调用。
 
+服务提供**会话事件订阅（SSE）**：`GET /__events/stream` 按 `events` 表的全局
+递增 `id` 推送全部已提交事件（业务命中与超时迁移均在其中），支持按 `token`
+过滤；客户端用 `Last-Event-ID` 请求头或 `after_id` 查询参数指定补发游标
+（同传时以请求头为准），未传游标则从**连接时**最新事件之后开始只收实时事件。
+补发按 id 分批进行并与实时推送无缝衔接，**不漏发、不重复**；每个事件的 SSE
+`id` 即行 id，浏览器 `EventSource` 断连重连自动续传；空闲时发送心跳，非法游标
+返回 `422`。
+
 - 技术栈：Python 3.12 · FastAPI · SQLite（WAL）· Jinja2 沙箱模板 · PyYAML
 - 容器内启动即自动完成依赖安装与数据库初始化（含旧库就地升级），并自动加载 `scenarios/` 下的示例场景
 
@@ -57,6 +65,7 @@ docker compose up --build -d
 | 会话快照分支 | `POST http://localhost:8080/__sessions/{token}/fork` |
 | 请求预演 | `POST http://localhost:8080/__sessions/{token}/preview` |
 | 连续请求链预演 | `POST http://localhost:8080/__sessions/{token}/preview/chain` |
+| 事件订阅（SSE） | `GET http://localhost:8080/__events/stream` |
 | 模拟业务流量 | 除上述管理前缀外的任意路径，如 `POST http://localhost:8080/orders` |
 
 停止：`docker compose down`（数据保留在命名卷 `simulator-data` 中；加 `-v` 一并清除）。
@@ -827,6 +836,78 @@ curl -s -X POST $BASE/__sessions/c1/preview/chain \
 - 请求体：`application/json` 按 JSON 解析；`application/x-www-form-urlencoded`
   按表单解析；YAML 的 content-type 按 YAML 解析；其他文本保存为 `body._raw`。
 
+### 会话事件订阅（SSE）
+
+`GET /__events/stream` 是一条 [Server-Sent Events](https://developer.mozilla.org/docs/Web/API/Server-sent_events)
+长连接，按 `events` 表的**全局递增 `id`** 把每次规则命中与每次超时迁移实时推给
+所有订阅者：
+
+- **游标**：`Last-Event-ID` 请求头或 `?after_id=N` 查询参数指定“只收 id 严格
+  大于 N 的事件”；**两者同传时以请求头为准**；未传游标时以**连接建立时**的
+  最大事件 id 为界，即只收连接之后提交的新事件（历史事件不补发）；
+- **补发 → 实时无缝衔接**：带游标连接时，服务先按全局 id **分批**（每批 1000 条）
+  补发历史事件，追平后转入持续推送；补发与实时共用同一条 `id > cursor` 的严格
+  递增推进，且订阅登记先于首次查库——补发末尾与实时唤醒之间提交的事件由首轮
+  实时查询兜底，**不漏发、不重复**；
+- **按令牌过滤**：`?token=t1` 只订阅该会话；可重复传入同时订阅多个会话
+  （`?token=t1&token=t2`）；不传则订阅全部会话；
+- **事件内容**：每条消息的 SSE `id` 字段即事件行 id，`data` 为 JSON，含
+  `id`、`token`、`scenario`、`revision`、`method`、`route`、`rule`、
+  `path`、`from_state`、`to_state`、`status_code`、`created_at`；超时迁移
+  事件同样推送（`method=ADVANCE`、`route=@timeout`、`rule=timeout:<from>`、
+  `status_code=null`）；
+- **心跳与断连**：无事件时空闲约 15 秒发送一条 SSE 注释心跳（`: heartbeat …`，
+  EventSource 不向应用暴露，仅用于保活与防代理超时）；检测到客户端断连后
+  立即停止读取数据库并注销订阅；
+- **非法游标**：`after_id` / `Last-Event-ID` 不是非负整数（负数、小数、
+  非数字文本）时返回 `422 invalid_after_id`。
+
+```bash
+BASE=http://localhost:8080
+
+# 订阅全部会话的新事件（不带游标：只收连接之后的事件），-N 关闭 curl 缓冲
+curl -N "$BASE/__events/stream"
+
+# 只订阅 t1，从最早事件开始补发并保持实时
+curl -N "$BASE/__events/stream?token=t1&after_id=0"
+
+# 同时订阅 t1 与 t2，从 id=100 之后续传
+curl -N "$BASE/__events/stream?token=t1&token=t2&after_id=100"
+
+# 用请求头指定游标（与 after_id 同传时以请求头为准）
+curl -N -H 'Last-Event-ID: 100' "$BASE/__events/stream"
+
+# 非法游标 -> 422
+curl -i "$BASE/__events/stream?after_id=abc"
+```
+
+典型输出（每条事件两行：`id:` + `data:`；以空行分隔）：
+
+```
+: connected after_id=0 scope=全部会话
+: 补发历史事件后将持续推送新事件；空闲 15s 发送一次心跳
+
+id: 1
+data: {"id":1,"token":"t1","scenario":"order-flow","revision":1,"method":"POST","path":"/orders","route":"create-order","rule":"create-success","from_state":"init","to_state":"created","status_code":201,"created_at":"2026-09-26 12:00:00"}
+
+id: 2
+data: {"id":2,"token":"t1","scenario":"order-flow","revision":1,"method":"ADVANCE","path":"/__sessions/t1/advance","route":"@timeout","rule":"timeout:created","from_state":"created","to_state":"cancelled","status_code":null,"created_at":"2026-09-26 12:00:01"}
+```
+
+浏览器中使用 `EventSource` 时，断连重连会自动带上最后收到的 `Last-Event-ID`，
+无需自行管理游标：
+
+```js
+const es = new EventSource("/__events/stream?token=t1&after_id=0");
+es.onmessage = (ev) => {
+  const event = JSON.parse(ev.data);
+  console.log(ev.lastEventId, event.from_state, "->", event.to_state);
+};
+```
+
+> 注意：SSE 为 GET 请求，不要把它与模拟业务流量的全路径转发混淆——
+> `/__events/stream` 是在 catch-all 之前注册的管理路由，不会进入场景匹配。
+
 ---
 
 ## 并发安全：为什么迁移不会重复触发
@@ -846,7 +927,8 @@ curl -s -X POST $BASE/__sessions/c1/preview/chain \
 
 > 部署限制：SQLite 的写锁是**进程内文件级**的，因此容器固定 `--workers 1`。
 > 单 worker + 异步框架足以支撑联调量级的并发；会话状态使用线程局部连接，
-> 同步事务段很短，不阻塞事件循环。
+> 同步事务段很短，不阻塞事件循环。SSE 事件总线同样是进程内的，单 worker
+> 即可保证所有写提交都能实时唤醒同进程内的订阅连接。
 
 ---
 
@@ -885,10 +967,12 @@ SIM_SCENARIOS_DIR=/app/scenarios docker compose run --rm \
 │   ├── matching.py        # 路径模式、点路径取值、条件运算符
 │   ├── renderer.py        # Jinja2 沙箱渲染、模板函数与会话级确定性随机源（seed）
 │   ├── engine.py          # 核心：单事务匹配→渲染→迁移；虚拟时钟 advance 超时连续结算；同快照只读预演（零副作用）；两 revision 纯内存版本回归对比
+│   ├── event_bus.py       # 进程内事件总线：写事务提交后唤醒 SSE 订阅者（单 worker 权威）
 │   ├── store.py           # 已编译场景缓存（按 name+revision）、发布/激活
 │   └── routers/
 │       ├── scenarios.py   # 场景校验/版本发布/版本列表/激活/查询/删除/版本回归对比
-│       └── sessions.py    # 会话创建/状态查询/advance 时钟推进/重置/fork/事件/预演
+│       ├── sessions.py    # 会话创建/状态查询/advance 时钟推进/重置/fork/事件/预演
+│       └── events.py      # GET /__events/stream：SSE 事件订阅（游标补发+实时推送/token 过滤/心跳/422）
 ├── scenarios/
 │   └── order-flow.yaml    # 示例场景（随启动自动加载）
 ├── requirements.txt

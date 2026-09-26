@@ -26,6 +26,7 @@ from typing import Any
 from urllib.parse import parse_qsl
 
 from .db import dumps, read_tx, write_tx
+from .event_bus import event_bus
 from .matching import evaluate_condition, get_condition_value, match_path
 from .models import Route, Rule, Scenario
 from .renderer import RenderError, Renderer, SessionRNG
@@ -377,8 +378,11 @@ async def simulate(request, default_scenario: str | None = None) -> SimResult:
     explicit_scenario = request.headers.get("sim-scenario")
 
     with write_tx() as conn:
-        return _run_locked(conn, token, method, path, query, headers, body,
-                           default_scenario, explicit_scenario)
+        result = _run_locked(conn, token, method, path, query, headers, body,
+                             default_scenario, explicit_scenario)
+    # 事务已提交：唤醒事件流订阅者，让它们立刻读到新事件（回滚路径不发）
+    event_bus.publish()
+    return result
 
 
 def _run_locked(conn, token, method, path, query, headers, body,
@@ -635,7 +639,7 @@ def advance_session(token: str, delta_ms: int) -> dict[str, Any]:
                 "remaining_ms": max(0, timeout_at_ms - target_clock),
             }
 
-        return {
+        result = {
             "advanced": True,
             "token": token,
             "scenario": scenario_name,
@@ -654,6 +658,9 @@ def advance_session(token: str, delta_ms: int) -> dict[str, Any]:
                 "pending_timeout": pending_timeout,
             },
         }
+    # 事务提交（含每步超时迁移事件）后唤醒事件流订阅者；回滚路径不发
+    event_bus.publish()
+    return result
 
 
 # ---------------------------------------------------------------------------

@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse, Response
 from .config import settings
 from .db import init_db
 from .engine import SimAbort, SimResult, simulate
-from .routers import scenarios, sessions
+from .routers import events, scenarios, sessions
 from .store import store
 
 logger = logging.getLogger("simulator")
@@ -63,6 +63,7 @@ app = FastAPI(
 
 app.include_router(scenarios.router)
 app.include_router(sessions.router)
+app.include_router(events.router)
 
 
 @app.get("/__health", tags=["meta"])
