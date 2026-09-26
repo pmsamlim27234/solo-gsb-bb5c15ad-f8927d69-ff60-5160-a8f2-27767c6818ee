@@ -1,0 +1,445 @@
+"""会话管理接口：创建 / 查询状态 / 重置 / 事件历史 / 单请求与请求链预演。"""
+from __future__ import annotations
+
+import json
+import secrets
+import sqlite3
+from typing import Any
+
+from fastapi import APIRouter
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, field_validator
+
+from ..db import dumps, get_conn, write_tx
+from ..engine import MAX_PREVIEW_STEPS, SimAbort, advance_session, preview_chain, preview_session
+from ..renderer import SessionRNG
+from ..store import store
+
+router = APIRouter(prefix="/__sessions", tags=["sessions"])
+
+
+def _validate_seed(value: Any) -> Any:
+    """seed 只接受 JSON 标量；None 表示不启用可复现随机序列。"""
+    if value is None:
+        return None
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    raise ValueError("seed 必须是字符串、数字或布尔值")
+
+
+class CreateSessionBody(BaseModel):
+    token: str | None = Field(default=None, description="不传则自动生成")
+    scenario: str | None = None
+    state: str | None = None
+    context: dict = Field(default_factory=dict)
+    seed: Any = Field(default=None,
+                      description="可选随机种子（字符串/数字/布尔）：传入后 "
+                                  "uuid4()/random_str()/randint()/choice() 按会话级"
+                                  "确定性序列取值")
+
+    _check_seed = field_validator("seed")(_validate_seed)
+
+
+def _session_row(token: str):
+    return get_conn().execute(
+        """
+        SELECT s.token, s.scenario, s.revision, s.state, s.context,
+               s.clock_ms, s.timeout_at_ms, s.created_at, s.updated_at
+        FROM sessions s WHERE s.token = ?
+        """,
+        (token,),
+    ).fetchone()
+
+
+def _serialize(row, *, with_schedule: bool = True) -> dict:
+    context = json.loads(row["context"])
+    # 内部随机状态不随上下文原文暴露，以摘要形式给出（含累计抽样步数）
+    random_info = SessionRNG.info(context)
+    context.pop(SessionRNG.STATE_KEY, None)
+    result = {
+        "token": row["token"],
+        "scenario": row["scenario"],
+        "revision": row["revision"],
+        "state": row["state"],
+        "context": context,
+        "random": random_info,
+        "clock_ms": int(row["clock_ms"] or 0),
+        "timeout_at_ms": row["timeout_at_ms"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+    if with_schedule:
+        # 当前状态是否还有待触发超时及其相对当前虚拟时钟的剩余时间
+        scenario = store.get(row["scenario"], row["revision"])
+        timeout = scenario.timeouts.get(row["state"]) if scenario is not None else None
+        at_ms = row["timeout_at_ms"]
+        if at_ms is not None and timeout is not None:
+            result["pending_timeout"] = {
+                "state": row["state"],
+                "after_ms": timeout.after_ms,
+                "at_ms": int(at_ms),
+                "remaining_ms": max(0, int(at_ms) - int(row["clock_ms"] or 0)),
+            }
+        else:
+            result["pending_timeout"] = None
+    return result
+
+
+@router.post("")
+async def create_session(body: CreateSessionBody) -> JSONResponse:
+    token = body.token or f"sess-{secrets.token_hex(12)}"
+
+    scenario_name = body.scenario
+    if scenario_name is None:
+        names = store.names()
+        if len(names) == 1:
+            scenario_name = names[0]
+        elif not names:
+            return JSONResponse(status_code=400, content={"error": "no_scenario_loaded"})
+        else:
+            return JSONResponse(status_code=409, content={
+                "error": "ambiguous_scenario", "scenarios": names,
+                "detail": "存在多个场景，请在 body.scenario 中指定",
+            })
+
+    found = store.get_current(scenario_name)
+    if found is None:
+        return JSONResponse(status_code=404, content={"error": "scenario_not_found",
+                                              "scenario": scenario_name})
+    scenario, revision = found  # 绑定此刻的当前 revision，之后不再随发布变化
+
+    state = body.state or scenario.initial_state
+    if state not in scenario.states:
+        return JSONResponse(status_code=422, content={"error": "unknown_state",
+                                              "state": state, "states": scenario.states})
+
+    context = dict(body.context)
+    context.setdefault("_seq", {})
+    if body.seed is not None:
+        # 传入 seed：随机序列从头初始化，随上下文在同一写事务中落库
+        context[SessionRNG.STATE_KEY] = SessionRNG.fresh(body.seed).snapshot()
+
+    # 创建即把虚拟时钟归零；初始状态声明了超时时按 after_ms 调度到期时刻
+    timeout_at_ms = scenario.timeouts[state].after_ms if state in scenario.timeouts else None
+
+    with write_tx() as conn:
+        try:
+            conn.execute(
+                "INSERT INTO sessions(token, scenario, revision, state, context,"
+                " clock_ms, timeout_at_ms) VALUES (?, ?, ?, ?, ?, 0, ?)",
+                (token, scenario_name, revision, state, dumps(context), timeout_at_ms),
+            )
+        except sqlite3.IntegrityError:
+            return JSONResponse(status_code=409, content={"error": "session_exists", "token": token})
+
+    row = _session_row(token)
+    return JSONResponse(status_code=201, content=_serialize(row))
+
+
+class ForkBody(BaseModel):
+    token: str | None = Field(default=None, description="目标会话令牌；不传则自动生成")
+
+
+@router.post("/{token}/fork")
+async def fork_session(token: str, body: ForkBody | None = None) -> JSONResponse:
+    """**会话快照分支**：在单个 SQLite 写事务中读取源会话并创建新 token。
+
+    完整复制绑定的 scenario revision、state、业务 context、`_seq` 计数器、
+    seed 随机序列位置（`_rng`）与虚拟时钟（`clock_ms`/`timeout_at_ms`）：
+    分支后首个相同请求（含 advance）得到与源会话同快照一致的结果。
+    事件历史不复制，分支后两条会话各自独立推进。
+    """
+    new_token = (body.token if body else None) or f"sess-{secrets.token_hex(12)}"
+
+    with write_tx() as conn:
+        row = conn.execute(
+            "SELECT scenario, revision, state, context, clock_ms, timeout_at_ms"
+            " FROM sessions WHERE token = ?",
+            (token,),
+        ).fetchone()
+        if row is None:
+            return JSONResponse(status_code=404,
+                                content={"error": "session_not_found", "token": token})
+
+        scenario_name = row["scenario"]
+        revision = row["revision"]
+        if revision is None:  # 兜底：异常旧数据缺 revision 时按当前版本处理
+            revision = store.current_revision(scenario_name)
+        if store.get(scenario_name, revision) is None:
+            return JSONResponse(status_code=410, content={
+                "error": "scenario_unloaded", "scenario": scenario_name,
+                "revision": revision,
+                "detail": "源会话绑定的场景版本已卸载，无法分支",
+            })
+
+        try:
+            # context 原文整体复制：_seq 计数与 _rng 随机序列位置随之完整快照；
+            # 虚拟时钟（clock_ms/timeout_at_ms）一并完整复制；
+            # 事件历史（events 表）不复制
+            conn.execute(
+                "INSERT INTO sessions(token, scenario, revision, state, context,"
+                " clock_ms, timeout_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (new_token, scenario_name, row["revision"], row["state"], row["context"],
+                 int(row["clock_ms"] or 0), row["timeout_at_ms"]),
+            )
+        except sqlite3.IntegrityError:
+            return JSONResponse(status_code=409,
+                                content={"error": "session_exists", "token": new_token})
+
+    result = {
+        "forked": True,
+        "source_token": token,
+        **_serialize(_session_row(new_token)),
+        "events_copied": False,
+        "detail": "已复制绑定的 scenario revision、state、业务 context、seq 计数、"
+                  "随机序列位置与虚拟时钟；事件历史不复制，分支后两条会话独立推进",
+    }
+    return JSONResponse(status_code=201, content=result)
+
+
+@router.get("/{token}")
+async def get_session(token: str) -> JSONResponse:
+    row = _session_row(token)
+    if row is None:
+        return JSONResponse(status_code=404, content={"error": "session_not_found", "token": token})
+    result = _serialize(row)
+    # 可用状态与路由按会话绑定的 revision 给出，而非当前版本
+    scenario = store.get(row["scenario"], row["revision"])
+    if scenario is not None:
+        result["available_states"] = scenario.states
+        result["routes"] = [
+            {"id": r.id, "path": r.path, "methods": r.methods}
+            for r in scenario.routes
+        ]
+    return JSONResponse(result)
+
+
+@router.get("/{token}/events")
+async def list_events(token: str, limit: int = 50) -> JSONResponse:
+    if _session_row(token) is None:
+        return JSONResponse(status_code=404, content={"error": "session_not_found", "token": token})
+    limit = max(1, min(limit, 500))
+    rows = get_conn().execute(
+        """
+        SELECT id, revision, method, path, route, rule, from_state, to_state,
+               status_code, created_at
+        FROM events WHERE token = ? ORDER BY id DESC LIMIT ?
+        """,
+        (token, limit),
+    ).fetchall()
+    return JSONResponse({"token": token, "events": [dict(r) for r in rows]})
+
+
+class AdvanceBody(BaseModel):
+    # StrictInt：拒绝 true/false 与浮点字符串等隐式转换，只接受整数
+    delta_ms: int = Field(
+        strict=True,
+        description="虚拟时钟推进的毫秒数（非负整数）；窗口内到期的状态超时"
+                    "会在同一写事务中按到期时刻连续迁移",
+    )
+
+    @field_validator("delta_ms")
+    @classmethod
+    def _validate_delta(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("delta_ms 必须是非负整数")
+        return value
+
+
+@router.post("/{token}/advance")
+async def advance(token: str, body: AdvanceBody) -> JSONResponse:
+    """**虚拟时钟推进**：以 delta_ms 推进该会话时钟并连续结算到期超时。
+
+    在单个 SQLite 写事务中按到期时刻依次执行超时迁移，返回每步
+    from/to/at 与最终快照；零延迟超时环会让整个 advance 原子回滚。
+    """
+    try:
+        payload = advance_session(token=token, delta_ms=body.delta_ms)
+    except SimAbort as exc:
+        return JSONResponse(status_code=exc.status_code, content=exc.body)
+    return JSONResponse(payload)
+
+
+class ResetBody(BaseModel):
+    state: str | None = None
+    context: dict | None = None
+    seed: Any = Field(default=None,
+                      description="可选随机种子：传入后随机序列从头初始化；"
+                                  "不传则重置后不再持有随机序列（除非 context 中显式给出）")
+
+    _check_seed = field_validator("seed")(_validate_seed)
+
+
+_ALLOWED_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
+
+
+class PreviewBody(BaseModel):
+    method: str | None = Field(default=None, description="HTTP 方法，默认 GET")
+    path: str = Field(description="业务路径，如 /orders/42/pay（不含 query）")
+    query: dict | None = Field(default=None, description="查询参数（多值取最后一个）")
+    headers: dict | None = Field(default=None, description="请求头，键名会归一化为小写")
+    body: Any = Field(default=None, description="请求体；与真实 JSON 请求一致，缺省视为空对象 {}")
+
+    @field_validator("path")
+    @classmethod
+    def _validate_path(cls, value: str) -> str:
+        if not isinstance(value, str) or not value.startswith("/"):
+            raise ValueError("path 必须是以 / 开头的字符串")
+        return value
+
+    @field_validator("method")
+    @classmethod
+    def _validate_method(cls, value: str | None) -> str | None:
+        if value is not None:
+            value = value.upper()
+            if value not in _ALLOWED_METHODS:
+                raise ValueError(f"不支持的 HTTP 方法: {value}")
+        return value
+
+    @field_validator("headers")
+    @classmethod
+    def _validate_headers(cls, value: dict | None) -> dict | None:
+        if value is None:
+            return None
+        if not all(isinstance(k, str) for k in value):
+            raise ValueError("headers 的键必须是字符串")
+        return {k.lower(): _stringify(v) for k, v in value.items()}
+
+    @field_validator("query")
+    @classmethod
+    def _validate_query(cls, value: dict | None) -> dict | None:
+        if value is None:
+            return None
+        if not all(isinstance(k, str) for k in value):
+            raise ValueError("query 的键必须是字符串")
+        return {k: _stringify(v) for k, v in value.items()}
+
+
+def _stringify(value: Any) -> str:
+    """真实 query/header 的值都是字符串；dict/list 退化为 JSON 文本。"""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    if value is None:
+        return ""
+    return str(value)
+
+
+@router.post("/{token}/preview")
+async def preview_request(token: str, body: PreviewBody) -> JSONResponse:
+    """**请求预演**：基于当前会话快照复用真实匹配/渲染逻辑，返回拟响应与差异，不落库。"""
+    method = body.method or "GET"
+    query = body.query or {}
+    headers = body.headers or {}
+    req_body = body.body if body.body is not None else {}
+
+    try:
+        status_code, payload = preview_session(
+            token=token,
+            method=method,
+            path=body.path,
+            query=query,
+            headers=headers,
+            body=req_body,
+            default_scenario=None,
+        )
+    except SimAbort as exc:
+        # 与真实请求一致的状态码和错误详情（404 无路由 / 405 方法不允许 /
+        # 410 场景已卸载 / 500 渲染错误等），并附判定轨迹
+        payload = dict(exc.body)
+        if exc.trace is not None:
+            payload["trace"] = exc.trace
+        payload["preview"] = {"persisted": False}
+        status_code = exc.status_code
+    return JSONResponse(status_code=status_code, content=payload)
+
+
+class ChainPreviewBody(BaseModel):
+    requests: list[PreviewBody] = Field(
+        description="有序业务请求数组；从会话当前快照起依次执行，"
+                    f"后一步看到前一步拟产生的变化，最多 {MAX_PREVIEW_STEPS} 步",
+        json_schema_extra={"maxItems": MAX_PREVIEW_STEPS},
+    )
+
+    @field_validator("requests")
+    @classmethod
+    def _validate_requests(cls, value: list[PreviewBody]) -> list[PreviewBody]:
+        if len(value) > MAX_PREVIEW_STEPS:
+            raise ValueError(
+                f"连续预演最多 {MAX_PREVIEW_STEPS} 步，收到 {len(value)} 步")
+        return value
+
+
+@router.post("/{token}/preview/chain")
+async def preview_request_chain(token: str, body: ChainPreviewBody) -> JSONResponse:
+    """**连续请求链预演**：有序请求基于同一会话快照依次试跑，不落库。
+
+    每一步复用与单次预演/真实请求完全相同的匹配与渲染语义，并能看到此前
+    各步拟产生的 state/context/seq 变化；任一步路由、规则或渲染失败立即
+    停止并返回失败步骤下标与此前结果。全程不写 sessions/events/计数。
+    """
+    requests = [
+        {
+            "method": step.method or "GET",
+            "path": step.path,
+            "query": step.query or {},
+            "headers": step.headers or {},
+            "body": step.body if step.body is not None else {},
+        }
+        for step in body.requests
+    ]
+
+    try:
+        status_code, payload = preview_chain(token=token, requests=requests)
+    except SimAbort as exc:
+        # 与真实请求一致的状态码和错误详情（410 场景已卸载等），并附判定轨迹
+        payload = dict(exc.body)
+        if exc.trace is not None:
+            payload["trace"] = exc.trace
+        payload["preview"] = {"persisted": False, "chain": True}
+        status_code = exc.status_code
+    return JSONResponse(status_code=status_code, content=payload)
+
+
+@router.post("/{token}/reset")
+async def reset_session(token: str, body: ResetBody) -> JSONResponse:
+    row = _session_row(token)
+    if row is None:
+        return JSONResponse(status_code=404, content={"error": "session_not_found", "token": token})
+    # 重置不改变会话绑定的 revision：状态合法性按绑定版本校验
+    scenario = store.get(row["scenario"], row["revision"])
+    if scenario is None:
+        return JSONResponse(status_code=410, content={"error": "scenario_unloaded"})
+
+    state = body.state or scenario.initial_state
+    if state not in scenario.states:
+        return JSONResponse(status_code=422, content={"error": "unknown_state",
+                                              "state": state, "states": scenario.states})
+    context = body.context if body.context is not None else {}
+    context.setdefault("_seq", {})
+    if body.seed is not None:
+        # 传入 seed：随机序列从头初始化（与创建会话时传 seed 等价）
+        context[SessionRNG.STATE_KEY] = SessionRNG.fresh(body.seed).snapshot()
+
+    # 重置把虚拟时钟归零，按重置后状态重新调度超时（旧到期时刻失效）
+    timeout_at_ms = scenario.timeouts[state].after_ms if state in scenario.timeouts else None
+
+    with write_tx() as conn:
+        conn.execute(
+            "UPDATE sessions SET state = ?, context = ?, clock_ms = 0,"
+            " timeout_at_ms = ?, updated_at = datetime('now') WHERE token = ?",
+            (state, dumps(context), timeout_at_ms, token),
+        )
+        conn.execute("DELETE FROM events WHERE token = ?", (token,))
+    return JSONResponse(_serialize(_session_row(token)))
+
+
+@router.delete("/{token}")
+async def delete_session(token: str) -> JSONResponse:
+    with write_tx() as conn:
+        cur = conn.execute("DELETE FROM events WHERE token = ?", (token,))
+        cur2 = conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+    if cur2.rowcount == 0:
+        return JSONResponse(status_code=404, content={"error": "session_not_found", "token": token})
+    return JSONResponse({"deleted": True, "token": token})
