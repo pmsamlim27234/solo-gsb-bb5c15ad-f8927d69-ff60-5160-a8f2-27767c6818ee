@@ -12,7 +12,8 @@ from fastapi.responses import JSONResponse, Response
 from .config import settings
 from .db import init_db
 from .engine import SimAbort, SimResult, simulate
-from .routers import scenarios, sessions
+from .events import event_bus
+from .routers import events, scenarios, sessions
 from .store import store
 
 logger = logging.getLogger("simulator")
@@ -61,13 +62,15 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.include_router(events.router)
 app.include_router(scenarios.router)
 app.include_router(sessions.router)
 
 
 @app.get("/__health", tags=["meta"])
 async def health() -> dict:
-    return {"status": "ok", "scenarios": store.names()}
+    return {"status": "ok", "scenarios": store.names(),
+            "event_subscribers": event_bus.subscriber_count}
 
 
 def _build_response(result: SimResult):

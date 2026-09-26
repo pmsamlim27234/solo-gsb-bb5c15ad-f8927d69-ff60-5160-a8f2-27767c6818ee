@@ -25,7 +25,8 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qsl
 
-from .db import dumps, read_tx, write_tx
+from .db import dumps, get_conn, read_tx, write_tx
+from .events import event_bus
 from .matching import evaluate_condition, get_condition_value, match_path
 from .models import Route, Rule, Scenario
 from .renderer import RenderError, Renderer, SessionRNG
@@ -360,6 +361,16 @@ def _timeout_due_at(scenario: Scenario, state: str, entered_at_ms: int) -> int |
 # 真实请求主入口
 # ---------------------------------------------------------------------------
 
+def _notify_event_subscribers() -> None:
+    """写事务提交后唤醒 SSE 订阅者（载荷为当前 events 表最大 id）。
+
+    只在事务**成功提交之后**调用：回滚（无路由/无命中规则/零延迟超时环等）
+    不会产生唤醒信号。订阅者按各自游标从库中拉取，故此处只传最大 id。
+    """
+    row = get_conn().execute("SELECT MAX(id) AS m FROM events").fetchone()
+    event_bus.publish(int(row["m"] or 0))
+
+
 async def simulate(request, default_scenario: str | None = None) -> SimResult:
     token = (request.headers.get("sim-session-token")
              or request.query_params.get("sim_session_token"))
@@ -377,8 +388,10 @@ async def simulate(request, default_scenario: str | None = None) -> SimResult:
     explicit_scenario = request.headers.get("sim-scenario")
 
     with write_tx() as conn:
-        return _run_locked(conn, token, method, path, query, headers, body,
-                           default_scenario, explicit_scenario)
+        result = _run_locked(conn, token, method, path, query, headers, body,
+                             default_scenario, explicit_scenario)
+    _notify_event_subscribers()
+    return result
 
 
 def _run_locked(conn, token, method, path, query, headers, body,
@@ -519,141 +532,150 @@ def advance_session(token: str, delta_ms: int) -> dict[str, Any]:
     （同一到期时刻重复进入同一状态）与渲染失败都会让整个事务原子回滚。
     """
     with write_tx() as conn:
-        row = conn.execute(
-            "SELECT scenario, revision, state, context, clock_ms, timeout_at_ms"
-            " FROM sessions WHERE token = ?",
-            (token,),
-        ).fetchone()
-        if row is None:
-            raise SimAbort(404, {"error": "session_not_found", "token": token})
+        payload = _advance_locked(conn, token, delta_ms)
+    if payload["transitions"]:
+        # 超时迁移事件随事务提交落库；无迁移的纯时钟推进不产生事件
+        _notify_event_subscribers()
+    return payload
 
-        scenario_name = row["scenario"]
-        revision = row["revision"]
-        if revision is None:
-            revision = store.current_revision(scenario_name)
-        scenario = store.get(scenario_name, revision)
-        if scenario is None:
-            raise SimAbort(410, {"error": "scenario_unloaded", "scenario": scenario_name})
 
-        state = row["state"]
-        context = json.loads(row["context"])
-        clock_before = int(row["clock_ms"] or 0)
-        timeout_at_ms: int | None = row["timeout_at_ms"]
-        target_clock = clock_before + delta_ms
+def _advance_locked(conn, token: str, delta_ms: int) -> dict[str, Any]:
+    row = conn.execute(
+        "SELECT scenario, revision, state, context, clock_ms, timeout_at_ms"
+        " FROM sessions WHERE token = ?",
+        (token,),
+    ).fetchone()
+    if row is None:
+        raise SimAbort(404, {"error": "session_not_found", "token": token})
 
-        # entered[state] = 本次 advance 内“进入该状态”的虚拟时刻；
-        # 同一状态在同一时刻被再次进入即构成零延迟超时环。初始状态也登记：
-        # 其进入时刻可由 (到期时刻 - after_ms) 反推，覆盖从首跳就成环的场景。
-        entered: dict[str, int] = {}
-        initial_timeout = scenario.timeouts.get(state)
-        if timeout_at_ms is not None and initial_timeout is not None:
-            entered[state] = timeout_at_ms - initial_timeout.after_ms
+    scenario_name = row["scenario"]
+    revision = row["revision"]
+    if revision is None:
+        revision = store.current_revision(scenario_name)
+    scenario = store.get(scenario_name, revision)
+    if scenario is None:
+        raise SimAbort(410, {"error": "scenario_unloaded", "scenario": scenario_name})
 
-        transitions: list[dict[str, Any]] = []
-        while timeout_at_ms is not None and timeout_at_ms <= target_clock:
-            timeout = scenario.timeouts.get(state)
-            if timeout is None:
-                # 兜底：状态无超时定义却存在到期时刻（数据不一致），当作超时失效
-                timeout_at_ms = None
-                break
-            if len(transitions) >= MAX_TIMEOUT_STEPS:
-                raise SimAbort(422, {
-                    "error": "timeout_chain_too_long",
-                    "detail": f"一次 advance 内超时迁移超过 {MAX_TIMEOUT_STEPS} 步"
-                              "（可能存在正延迟环），已原子回滚",
-                    "limit": MAX_TIMEOUT_STEPS,
-                    "at_ms": timeout_at_ms,
-                    "attempted_transitions": transitions,
-                    "rolled_back": True,
-                })
+    state = row["state"]
+    context = json.loads(row["context"])
+    clock_before = int(row["clock_ms"] or 0)
+    timeout_at_ms: int | None = row["timeout_at_ms"]
+    target_clock = clock_before + delta_ms
 
-            at_ms = timeout_at_ms
-            next_state = timeout.next_state
+    # entered[state] = 本次 advance 内“进入该状态”的虚拟时刻；
+    # 同一状态在同一时刻被再次进入即构成零延迟超时环。初始状态也登记：
+    # 其进入时刻可由 (到期时刻 - after_ms) 反推，覆盖从首跳就成环的场景。
+    entered: dict[str, int] = {}
+    initial_timeout = scenario.timeouts.get(state)
+    if timeout_at_ms is not None and initial_timeout is not None:
+        entered[state] = timeout_at_ms - initial_timeout.after_ms
 
-            if entered.get(next_state) == at_ms:
-                # 零延迟环：next_state 已在同一虚拟时刻进入过 -> 无限迁移，回滚
-                raise SimAbort(409, {
-                    "error": "timeout_cycle",
-                    "detail": f"检测到零延迟超时环：状态 {next_state} 在同一虚拟时刻 "
-                              f"{at_ms}ms 被重复进入，本次 advance 已原子回滚",
-                    "at_ms": at_ms,
-                    "cycle": {"from": state, "to": next_state},
-                    "attempted_transitions": transitions,
-                    "rolled_back": True,
-                })
-
-            from_state = state
-            new_context = _render_timeout_set(
-                timeout, state=state, context=context,
-                at_ms=at_ms, request_path=f"/__sessions/{token}/advance")
-            applied = {k: v for k, v in new_context.items()
-                       if k not in context or context[k] != v}
-            applied.pop("_seq", None)
-            applied.pop(SessionRNG.STATE_KEY, None)
-
-            # 事件先落库（环/渲染异常时随事务一并回滚，不会残留）
-            conn.execute(
-                """
-                INSERT INTO events(token, scenario, revision, method, path, route, rule,
-                                   from_state, to_state, status_code)
-                VALUES (?, ?, ?, 'ADVANCE', ?, '@timeout', ?, ?, ?, NULL)
-                """,
-                (token, scenario_name, revision,
-                 f"/__sessions/{token}/advance",
-                 f"timeout:{from_state}", from_state, next_state),
-            )
-
-            transitions.append({
-                "index": len(transitions),
-                "from": from_state,
-                "to": next_state,
-                "at": at_ms,
-                "after_ms": timeout.after_ms,
-                "set": applied,
+    transitions: list[dict[str, Any]] = []
+    while timeout_at_ms is not None and timeout_at_ms <= target_clock:
+        timeout = scenario.timeouts.get(state)
+        if timeout is None:
+            # 兜底：状态无超时定义却存在到期时刻（数据不一致），当作超时失效
+            timeout_at_ms = None
+            break
+        if len(transitions) >= MAX_TIMEOUT_STEPS:
+            raise SimAbort(422, {
+                "error": "timeout_chain_too_long",
+                "detail": f"一次 advance 内超时迁移超过 {MAX_TIMEOUT_STEPS} 步"
+                          "（可能存在正延迟环），已原子回滚",
+                "limit": MAX_TIMEOUT_STEPS,
+                "at_ms": timeout_at_ms,
+                "attempted_transitions": transitions,
+                "rolled_back": True,
             })
 
-            # 同一 advance 内新状态产生的超时继续在本循环结算
-            entered[next_state] = at_ms
-            state = next_state
-            context = new_context
-            timeout_at_ms = _timeout_due_at(scenario, state, at_ms)
+        at_ms = timeout_at_ms
+        next_state = timeout.next_state
 
-        # 全部到期迁移结算完毕：时钟落到目标时刻，最终状态的到期时刻保留
+        if entered.get(next_state) == at_ms:
+            # 零延迟环：next_state 已在同一虚拟时刻进入过 -> 无限迁移，回滚
+            raise SimAbort(409, {
+                "error": "timeout_cycle",
+                "detail": f"检测到零延迟超时环：状态 {next_state} 在同一虚拟时刻 "
+                          f"{at_ms}ms 被重复进入，本次 advance 已原子回滚",
+                "at_ms": at_ms,
+                "cycle": {"from": state, "to": next_state},
+                "attempted_transitions": transitions,
+                "rolled_back": True,
+            })
+
+        from_state = state
+        new_context = _render_timeout_set(
+            timeout, state=state, context=context,
+            at_ms=at_ms, request_path=f"/__sessions/{token}/advance")
+        applied = {k: v for k, v in new_context.items()
+                   if k not in context or context[k] != v}
+        applied.pop("_seq", None)
+        applied.pop(SessionRNG.STATE_KEY, None)
+
+        # 事件先落库（环/渲染异常时随事务一并回滚，不会残留）
         conn.execute(
-            "UPDATE sessions SET state = ?, context = ?, clock_ms = ?, timeout_at_ms = ?,"
-            " updated_at = datetime('now') WHERE token = ?",
-            (state, dumps(context), target_clock, timeout_at_ms, token),
+            """
+            INSERT INTO events(token, scenario, revision, method, path, route, rule,
+                               from_state, to_state, status_code)
+            VALUES (?, ?, ?, 'ADVANCE', ?, '@timeout', ?, ?, ?, NULL)
+            """,
+            (token, scenario_name, revision,
+             f"/__sessions/{token}/advance",
+             f"timeout:{from_state}", from_state, next_state),
         )
 
-        pending_timeout = None
-        if timeout_at_ms is not None:
-            pending = scenario.timeouts.get(state)
-            pending_timeout = {
-                "state": state,
-                "after_ms": pending.after_ms if pending else None,
-                "at_ms": timeout_at_ms,
-                "remaining_ms": max(0, timeout_at_ms - target_clock),
-            }
+        transitions.append({
+            "index": len(transitions),
+            "from": from_state,
+            "to": next_state,
+            "at": at_ms,
+            "after_ms": timeout.after_ms,
+            "set": applied,
+        })
 
-        return {
-            "advanced": True,
-            "token": token,
-            "scenario": scenario_name,
-            "revision": revision,
-            "clock_ms": {"before": clock_before, "after": target_clock},
-            "delta_ms": delta_ms,
-            "transitions": transitions,
-            "final_snapshot": {
-                "state": state,
-                "context": {k: v for k, v in context.items()
-                            if k not in ("_seq", SessionRNG.STATE_KEY)},
-                "seq": dict(context.get("_seq", {}) or {}),
-                "random": SessionRNG.info(context),
-                "clock_ms": target_clock,
-                "timeout_at_ms": timeout_at_ms,
-                "pending_timeout": pending_timeout,
-            },
+        # 同一 advance 内新状态产生的超时继续在本循环结算
+        entered[next_state] = at_ms
+        state = next_state
+        context = new_context
+        timeout_at_ms = _timeout_due_at(scenario, state, at_ms)
+
+    # 全部到期迁移结算完毕：时钟落到目标时刻，最终状态的到期时刻保留
+    conn.execute(
+        "UPDATE sessions SET state = ?, context = ?, clock_ms = ?, timeout_at_ms = ?,"
+        " updated_at = datetime('now') WHERE token = ?",
+        (state, dumps(context), target_clock, timeout_at_ms, token),
+    )
+
+    pending_timeout = None
+    if timeout_at_ms is not None:
+        pending = scenario.timeouts.get(state)
+        pending_timeout = {
+            "state": state,
+            "after_ms": pending.after_ms if pending else None,
+            "at_ms": timeout_at_ms,
+            "remaining_ms": max(0, timeout_at_ms - target_clock),
         }
+
+    return {
+        "advanced": True,
+        "token": token,
+        "scenario": scenario_name,
+        "revision": revision,
+        "clock_ms": {"before": clock_before, "after": target_clock},
+        "delta_ms": delta_ms,
+        "transitions": transitions,
+        "final_snapshot": {
+            "state": state,
+            "context": {k: v for k, v in context.items()
+                        if k not in ("_seq", SessionRNG.STATE_KEY)},
+            "seq": dict(context.get("_seq", {}) or {}),
+            "random": SessionRNG.info(context),
+            "clock_ms": target_clock,
+            "timeout_at_ms": timeout_at_ms,
+            "pending_timeout": pending_timeout,
+        },
+    }
+
 
 
 # ---------------------------------------------------------------------------

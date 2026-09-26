@@ -33,6 +33,14 @@ YAML 场景，服务按**会话令牌**隔离每个调用方的当前状态，�
 结果与 `first_difference`，任一侧单步失败只记录该侧、不影响另一侧。整个过程
 **不写 sessions/events、不持久化随机计数**，可反复调用。
 
+会话事件还可以**实时订阅**：`GET /__events/stream` 是一个 Server-Sent Events
+（SSE）长连接，按 `events` 表全局递增 id 先**分批补发**游标之后的已提交事件，
+再**持续推送**之后提交的新事件（业务请求与虚拟时钟超时迁移都会推），支持按
+`token` 过滤；客户端用 `Last-Event-ID` 请求头或 `?after_id=` 查询参数指定游标
+（两者同传以请求头为准），断连后可用最后收到的 `id` 无缝续传——补发与实时
+阶段共用同一条按游标的读取循环，衔接处**不漏发、不重复**；空闲时发送心跳，
+非法游标返回 `422`。
+
 - 技术栈：Python 3.12 · FastAPI · SQLite（WAL）· Jinja2 沙箱模板 · PyYAML
 - 容器内启动即自动完成依赖安装与数据库初始化（含旧库就地升级），并自动加载 `scenarios/` 下的示例场景
 
@@ -57,6 +65,7 @@ docker compose up --build -d
 | 会话快照分支 | `POST http://localhost:8080/__sessions/{token}/fork` |
 | 请求预演 | `POST http://localhost:8080/__sessions/{token}/preview` |
 | 连续请求链预演 | `POST http://localhost:8080/__sessions/{token}/preview/chain` |
+| **事件实时订阅（SSE）** | `GET http://localhost:8080/__events/stream`（可用 `?token=` 过滤、`?after_id=` 或 `Last-Event-ID` 续传） |
 | 模拟业务流量 | 除上述管理前缀外的任意路径，如 `POST http://localhost:8080/orders` |
 
 停止：`docker compose down`（数据保留在命名卷 `simulator-data` 中；加 `-v` 一并清除）。
@@ -102,6 +111,12 @@ curl -s -X POST $BASE/orders -H 'sim-session-token: t2' \
 curl -s -X POST $BASE/__sessions/t2/advance \
   -H 'Content-Type: application/json' -d '{"delta_ms":1800000}'
 # -> transitions: [{from: created, to: cancelled, at: 1800000, ...}]
+
+# 6) 实时订阅事件（SSE）：另开一个终端先连上，再发业务请求/推进时钟
+curl -N "$BASE/__events/stream?token=t1"
+# 只听新事件（不带游标）；带上历史游标可先补发再实时，例如：
+curl -N "$BASE/__events/stream?after_id=0"          # 从头补发全部事件
+curl -N "$BASE/__events/stream" -H 'Last-Event-ID: 12'  # 标准 SSE 断点续传
 ```
 
 每个模拟响应还带有调试响应头：
@@ -438,6 +453,77 @@ revision 1 尚未到期（30 分钟）而 revision 2 已自动取消（20 分钟
 | POST | `/__sessions/{token}/preview/chain` | **连续请求链预演**：有序请求数组基于同一会话快照依次试跑（最多 50 步），逐步返回命中/拟响应/差异与最终快照，不落库 |
 | POST | `/__sessions/{token}/reset` | 重置到初始（或指定）状态、虚拟时钟归零并清空事件；不改变会话绑定的 revision；可传 `"seed"` 让随机序列从头初始化 |
 | DELETE | `/__sessions/{token}` | 删除会话及其事件 |
+
+### 事件实时订阅（SSE）
+
+`GET /__events/stream` 以 [Server-Sent Events](https://developer.mozilla.org/docs/Web/API/Server-sent_events)
+长连接推送 `events` 表中的每一条已提交事件——业务请求命中与**虚拟时钟超时迁移**
+都会推送。响应为 `text/event-stream`，事件以全局自增 `id` 为 SSE 帧 id，
+`event: sim-event`，`data` 为事件 JSON：
+
+```
+id: 7
+event: sim-event
+data: {"id":7,"token":"t2","scenario":"order-flow","revision":1,"method":"ADVANCE","path":"/__sessions/t2/advance","route":"@timeout","rule":"timeout:created","from_state":"created","to_state":"cancelled","status_code":null,"created_at":"2026-09-26 12:00:00"}
+```
+
+字段：`id`（全局递增游标）、`token`、`scenario`、`revision`、`method`、`route`、
+`rule`、`path`、`from_state`/`to_state`（迁移前后状态）、`status_code`（超时迁移
+为 `null`）、`created_at`。超时迁移事件固定为
+`method=ADVANCE`、`route=@timeout`、`rule=timeout:<from状态>`。
+
+**游标语义（续传）**
+
+| 用法 | 行为 |
+| --- | --- |
+| 不带任何游标 | 只推送**连接建立之后**提交的新事件（从连接时刻的最新事件之后开始），历史不补发 |
+| `?after_id=12` | 先**分批补发** `id > 12` 的全部已提交事件（按 id 升序），再无缝进入实时推送 |
+| 请求头 `Last-Event-ID: 12` | 同上；这是浏览器 `EventSource` 断线重连自动携带的标准头 |
+| 头与 `after_id` 同传 | **以 `Last-Event-ID` 请求头为准**，忽略查询参数 |
+| 游标非法（非数字/负数/小数）或大于当前最大 id | 返回 `422 {"error":"invalid_cursor", ...}` |
+
+补发与实时共用同一条「按游标读库 → 等待提交信号 → 再按游标读库」的循环：
+服务端在任何历史读取**之前**先登记订阅，写事务**提交后**才发出唤醒信号，
+因此衔接窗口内提交的事件要么已在补发批次中、要么留在实时队列里，**不漏发、
+不重复**；读库始终以严格大于游标的 id 为界，天然幂等。客户端断线重连时只需
+把最后收到的帧 `id` 通过 `Last-Event-ID`（或 `after_id`）带回，即可从断点继续。
+
+**按 token 过滤**：`GET /__events/stream?token=t1` 只推送该会话的事件（补发与
+实时都过滤）；不传则推送所有会话。过滤在数据库查询中完成，与全局游标配合
+仍然不漏不重。
+
+**心跳与断连**：无新事件时服务端按 `SIM_SSE_HEARTBEAT_SECONDS`（默认 15 秒）
+发送 SSE 注释行心跳（`: heartbeat`），保活连接并让客户端/代理及时发现断链；
+客户端断开后服务端立即停止该连接的读取并注销订阅（`/__health` 的
+`event_subscribers` 反映当前订阅数）。补发批量大小由 `SIM_SSE_BATCH_SIZE`
+（默认 100）控制。
+
+```bash
+# 终端 A：从头订阅全部会话的事件
+curl -N "$BASE/__events/stream?after_id=0"
+
+# 终端 B：只看 t1，并制造业务事件与超时事件
+curl -s -X POST $BASE/orders -H 'sim-session-token: t1' \
+  -H 'Content-Type: application/json' -d '{"sku":"A-1","quantity":2}'
+curl -s -X POST $BASE/__sessions/t1/advance \
+  -H 'Content-Type: application/json' -d '{"delta_ms":1800000}'
+```
+
+浏览器端使用原生 `EventSource` 即可自动重连与续传：
+
+```javascript
+const es = new EventSource("http://localhost:8080/__events/stream?token=t1");
+es.addEventListener("sim-event", (e) => {
+  const ev = JSON.parse(e.data);      // e.lastEventId === String(ev.id)
+  console.log(ev.from_state, "->", ev.to_state);
+});
+// 断线后浏览器会自动带上 Last-Event-ID: <最后一条id> 重连，服务端从断点补发
+```
+
+> 部署说明：实时推送基于进程内事件总线（写事务提交后内存唤醒），与容器固定的
+> `--workers 1` 单 worker 部署一致；事件本身始终以 SQLite 中**已提交**的行为准，
+> 即使唤醒信号丢失，下一次心跳周期也会按游标重新读库追平，且写请求永远不会
+> 被慢订阅者阻塞。
 
 #### 可复现随机序列（seed）
 
@@ -846,7 +932,8 @@ curl -s -X POST $BASE/__sessions/c1/preview/chain \
 
 > 部署限制：SQLite 的写锁是**进程内文件级**的，因此容器固定 `--workers 1`。
 > 单 worker + 异步框架足以支撑联调量级的并发；会话状态使用线程局部连接，
-> 同步事务段很短，不阻塞事件循环。
+> 同步事务段很短，不阻塞事件循环。SSE 实时订阅同样基于进程内事件总线，
+> 多 worker 部署需改用外部消息通道（当前部署模型不需要）。
 
 ---
 
@@ -860,6 +947,8 @@ curl -s -X POST $BASE/__sessions/c1/preview/chain \
 | `SIM_DEFAULT_SCENARIO` | 空 | 多场景时未显式指定场景的默认场景名 |
 | `SIM_BUSY_TIMEOUT_MS` | `5000` | 写锁等待毫秒 |
 | `SIM_DB_RETRIES` | `20` | 锁冲突时的应用侧重试次数（每次 20ms 起退避） |
+| `SIM_SSE_HEARTBEAT_SECONDS` | `15` | SSE 订阅连接空闲心跳间隔（秒，可为小数） |
+| `SIM_SSE_BATCH_SIZE` | `100` | SSE 补发阶段每批从 `events` 表读取的事件数 |
 | `SIM_LOG_LEVEL` | `info` | 日志级别 |
 
 自定义场景目录（改 YAML 无需重新构建镜像）：
@@ -886,9 +975,11 @@ SIM_SCENARIOS_DIR=/app/scenarios docker compose run --rm \
 │   ├── renderer.py        # Jinja2 沙箱渲染、模板函数与会话级确定性随机源（seed）
 │   ├── engine.py          # 核心：单事务匹配→渲染→迁移；虚拟时钟 advance 超时连续结算；同快照只读预演（零副作用）；两 revision 纯内存版本回归对比
 │   ├── store.py           # 已编译场景缓存（按 name+revision）、发布/激活
+│   ├── events.py          # 进程内事件总线（写事务提交后唤醒 SSE 订阅者）
 │   └── routers/
 │       ├── scenarios.py   # 场景校验/版本发布/版本列表/激活/查询/删除/版本回归对比
-│       └── sessions.py    # 会话创建/状态查询/advance 时钟推进/重置/fork/事件/预演
+│       ├── sessions.py    # 会话创建/状态查询/advance 时钟推进/重置/fork/事件/预演
+│       └── events.py      # GET /__events/stream：SSE 事件订阅（游标补发+实时推送/token 过滤/心跳）
 ├── scenarios/
 │   └── order-flow.yaml    # 示例场景（随启动自动加载）
 ├── requirements.txt

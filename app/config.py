@@ -19,5 +19,7 @@ class Settings:
     busy_timeout_ms: int = int(os.getenv("SIM_BUSY_TIMEOUT_MS", "5000"))
     db_retries: int = int(os.getenv("SIM_DB_RETRIES", "20"))
     log_level: str = os.getenv("SIM_LOG_LEVEL", "info")
+    sse_heartbeat_seconds: float = float(os.getenv("SIM_SSE_HEARTBEAT_SECONDS", "15"))
+    sse_batch_size: int = int(os.getenv("SIM_SSE_BATCH_SIZE", "100"))
 
 settings = Settings()
